@@ -1,0 +1,67 @@
+## template: jinja
+#cloud-config
+
+#This file is templated 2 times:
+# * the first round is done by terraform, replaces dollar + single brackets
+# * the second round is done by cloudinit jinja,  replace double brackets
+#
+packages:
+  - awscli
+  - jq
+  - python3-pip
+  - xmlstarlet
+  - zip
+runcmd:
+  - zip -q -d /usr/local/forcepoint/smc/lib/base/log4j-core-*.jar org/apache/logging/log4j/core/lookup/JndiLookup.class
+  - mkdir -p ${tmp_provision} && chown sgadmin:sgadmin ${tmp_provision}
+  - pip3 --retries 10 install fp-ngfw-smc-python==${smc_python_version}
+%{ if length(primary_instance) != 0 ~}
+  - bash /usr/local/bin/wait_mgmt_primary.sh "{{v1.region}}" "${primary_instance}" "${queue_url}"
+%{ endif ~}
+%{ for entry in LogConfiguration_entries ~}
+  - >
+      su sgadmin -c
+      "replace_or_add_in_file.sh ${sg_data}/LogServerConfiguration.txt ${entry}"
+%{ endfor ~}
+  # Change log server memory if needed
+%{ if log_server_xmx_memory != "" ~}
+  - >
+    ${xml_base} -u /smc_starter/server/@MAX_MEMORY_IN_MB -v "${log_server_xmx_memory}" ${log_xml_file}
+%{ endif ~}
+   # Add VMArgs if needed
+%{ if length(log_server_vmargs) != 0 ~}
+  - >
+    ${insert_opt_base_log}
+    %{ for entry in log_server_vmargs ~}
+        ${xml_param_add} ${entry} ${log_xml_file}
+    %{ endfor ~}
+%{ endif ~}
+  #declare log server in primary mgmt
+  - >
+      create_server
+      --server-kind log_server
+      --host ${primary_hostname}
+      --port ${rest_api_port}
+      --api-version 6.8
+      --secure
+      --server-name ${log_name}
+      --server-ip {{ds.meta_data.local_ipv4}}
+      --locations public:{{ds.meta_data.public_ipv4}}
+%{ if logserver_local ~}
+      --with-local-logserver
+%{ endif ~}
+
+  - >
+      ${smc_bin}/install/sgLogProvision.sh
+      ReInitSMCDataBaseForCloud=true
+      login="${username}" pass="${password}"
+      active-server=${primary_ip}
+      logserver-name=${log_name}
+      logserver-ip={{ds.meta_data.local_ipv4}}
+  - ${smc_base}/bin/install/logservice.sh
+  - systemctl enable sgLogServer
+  - sed -i 's/h2aInstalledMgt=true/h2aInstalledMgt=false/' ${smc_base}/uninstall/history.txt
+  - sed -i 's/h2aInstalledLogService=false/h2aInstalledLogService=true/' ${smc_base}/uninstall/history.txt
+  #wipe tmp files related to provisioning
+  - rm -rf ${tmp_provision}
+  - sudo timeout 120 wait_server_started.sh -p ${smc_base} -s LOG

@@ -1,0 +1,114 @@
+## template: jinja
+#cloud-config
+
+#This file is templated 2 times:
+# * the first round is done by terraform, replaces dollar + single brackets
+# * the second round is done by cloudinit jinja,  replace double brackets
+
+runcmd:
+  - zip -q -d /usr/local/forcepoint/smc/lib/base/log4j-core-*.jar org/apache/logging/log4j/core/lookup/JndiLookup.class
+  - mkdir -p ${tmp_provision} && chown sgadmin:sgadmin ${tmp_provision}
+  - pip3 --retries 10 install fp-ngfw-smc-python==${smc_python_version}
+
+   # Wait for primary to be ready
+   # ----------------------------------
+%{ if length(primary_instance) != 0 ~}
+  - bash /usr/local/bin/wait_mgmt_primary.sh "{{v1.region}}" "${primary_instance}" "${queue_url}"
+%{ endif ~}
+
+   # Add VMArgs to data/smc_starter.xml
+   # ----------------------------------
+%{ if length(mgmt_server_vmargs) != 0 ~}
+  - >
+    ${insert_opt_base_mgmt}
+    %{ for entry in mgmt_server_vmargs ~}
+        ${xml_param_add} ${entry} ${smc_xml_file}
+    %{ endfor ~}
+%{ endif ~}
+
+  # Change mgt server memory if needed
+  # ----------------------------------
+%{ if mgmt_server_xmx_memory != "" ~}
+  - >
+    ${xml_base} -u /smc_starter/server/@MAX_MEMORY_IN_MB -v "${mgmt_server_xmx_memory}" ${smc_xml_file}
+%{ endif ~}
+
+  # generate ini file for sgNewProvision.sh
+  # ------------------------------------
+  - |
+      cat <<EOF_INI >${smc_ini_provisioning}
+      [mgt]
+      active-server = {{ds.meta_data.local_ipv4}}
+      mgtserver-location = Default:{{ds.meta_data.local_ipv4}}
+%{ for entry in SGConfiguration_entries ~}
+      SGConf = ${entry}
+%{ endfor ~}
+      [api]
+      port = ${rest_api_port}
+      hostname = {{ds.meta_data.public_hostname}}
+      https = true
+      public_key_output = ${tmp_provision}/cert_replica
+      login-api = ${api_client_username}
+      api_key_file = ${tmp_provision}/apik_replica
+      [web]
+      port = ${webswing_port}
+      hostname = {{ds.meta_data.public_hostname}}
+      https = true
+      public_key_output = ${tmp_provision}/webswing_cert
+      EOF_INI
+
+      chown sgadmin:sgadmin ${smc_ini_provisioning}
+
+  # provisioning
+  # ------------
+  - >
+      sudo -u sgadmin
+      ${smc_bin}/install/sgNewProvision.sh
+      ReInitSMCDataBaseForCloud=true
+      login="${username}" pass="${password}"
+      input=${smc_ini_provisioning}
+
+  #this is mandatory starting from 6.9 (before sgCertify was silently doing it)
+
+  - >
+      create_server
+      --server-kind mgt_server
+      --host ${primary_hostname}
+      --port ${rest_api_port}
+      --api-version 6.8
+      --secure
+      --server-name ${standby_name}
+      --server-ip {{ds.meta_data.local_ipv4}}
+      --locations Default:{{ds.meta_data.public_ipv4}}
+%{ if existing_location != "" ~}
+      --put-in-location ${existing_location}
+%{ endif ~}
+%{ if clone_web_apps != "" ~}
+      --clone-web-apps ${clone_web_apps}
+%{ endif ~}
+
+  # certify
+  # -------
+  - >
+      sudo -u sgadmin
+      ${smc_bin}/sgCertifyMgtSrv.sh
+      -nodisplay -standby login="${username}" pass="${password}"
+      active-server=${primary_ip}
+      standby-server=${standby_name}
+  - >
+      sudo -u sgadmin
+      ${smc_bin}/sgOnlineReplication.sh
+      -nodisplay
+      active-server=${primary_ip}
+
+  # register mgt daemon to systemd and start
+  # ----------------------------------------
+  - ${smc_base}/bin/install/mgtservice.sh
+  - systemctl enable sgMgtServer
+  - systemctl start sgMgtServer
+  - sed -i 's/h2aInstalledLog=true/h2aInstalledLog=false/'${smc_base}/uninstall/history.txt
+  - sed -i 's/h2aInstalledMgtService=false/h2aInstalledMgtService=true/' ${smc_base}/uninstall/history.txt
+
+  #wipe tmp files related to provisioning
+  # -------------------------------------
+  - rm -rf ${tmp_provision}

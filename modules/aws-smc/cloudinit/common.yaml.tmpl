@@ -1,0 +1,31 @@
+#cloud-config
+bootcmd:
+  # newer smcs doesn't install service, this is for retrocompatibility
+  - systemctl disable sgMgtServer || true
+  - systemctl stop sgMgtServer || true
+  - systemctl disable sgLogServer || true
+  - systemctl stop sgLogServer || true
+write_files:
+  - path: /usr/local/bin/replace_or_add_in_file.sh
+    permissions: '0655'
+    encoding: gz+b64
+    content: ${replace_script_content}
+  - path: /usr/local/bin/create_server
+    permissions: '0655'
+    encoding: gz+b64
+    content: ${create_server_content}
+  - path: /usr/local/bin/wait_mgmt_primary.sh
+    permissions: '0655'
+    owner: root
+    encoding: gz+b64
+    content: ${wait_mgmt_primary}
+  - path: /usr/local/bin/wait_server_started.sh
+    permissions: '0655'
+    owner: root
+    encoding: gz+b64
+    content: ${wait_server_started}
+apt:
+  conf: |
+    APT::Periodic::Enable "0";
+package_update: true
+package_upgrade: ${package_upgrade}

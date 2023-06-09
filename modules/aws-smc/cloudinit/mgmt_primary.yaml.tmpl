@@ -1,0 +1,123 @@
+## template: jinja
+#cloud-config
+
+# This file is templated 2 times:
+# * the first round is done by terraform, replaces dollar + single brackets
+# * the second round is done by cloudinit jinja,  replace double brackets
+
+runcmd:
+  - zip -q -d /usr/local/forcepoint/smc/lib/base/log4j-core-*.jar org/apache/logging/log4j/core/lookup/JndiLookup.class
+  - mkdir -p ${tmp_provision} && chown sgadmin:sgadmin ${tmp_provision}
+  - pip3 --retries 10 install fp-ngfw-smc-python==${smc_python_version}
+
+   # Add VMArgs to data/smc_starter.xml
+   # ----------------------------------
+%{ if length(mgmt_server_vmargs) != 0 ~}
+  - >
+      ${insert_opt_base_mgmt}
+      %{ for entry in mgmt_server_vmargs ~}
+        ${xml_param_add} ${entry} ${smc_xml_file}
+      %{ endfor ~}
+%{ endif ~}
+
+  # Change mgt server memory if needed
+  # ----------------------------------
+%{ if mgmt_server_xmx_memory != "" ~}
+  - >
+      ${xml_base} -u /smc_starter/server/@MAX_MEMORY_IN_MB -v "${mgmt_server_xmx_memory}" ${smc_xml_file}
+%{ endif ~}
+
+  # generate ini file for sgNewProvision.sh
+  # ------------------------------------
+  - |
+      cat <<EOF_INI >${smc_ini_provisioning}
+      [mgt]
+      active-server = {{ds.meta_data.local_ipv4}}
+      mgtserver-location = Default:{{ds.meta_data.local_ipv4}}
+      mgtserver-location = public:{{ds.meta_data.public_ipv4}}
+%{ for entry in SGConfiguration_entries ~}
+      SGConf = ${entry}
+%{ endfor ~}
+      [api]
+      port = ${rest_api_port}
+      hostname = {{ds.meta_data.public_hostname}}
+      https = true
+      public_key_output = ${tmp_provision}/cert
+      login-api = ${api_client_username}
+      api_key_file = ${tmp_provision}/apik
+      [web]
+      port = ${webswing_port}
+      hostname = {{ds.meta_data.public_hostname}}
+      https = true
+      public_key_output = ${tmp_provision}/webswing_cert
+%{ if logserver_local ~}
+      [log]
+      logserver-name = LogServer 127.0.0.2
+      logserver-ip = {{ds.meta_data.local_ipv4}}
+      auto-bind-license = false
+      new-element = false
+      logserver-location = Default:{{ds.meta_data.local_ipv4}}
+      logserver-location = public:{{ds.meta_data.public_ipv4}}
+%{ endif ~}
+      EOF_INI
+
+      chown sgadmin:sgadmin ${smc_ini_provisioning}
+
+  # provisioning
+  # ------------
+  - >
+      sudo -u sgadmin
+      ${smc_bin}/install/sgNewProvision.sh
+      ReInitSMCDataBaseForCloud=true
+      login="${username}" pass="${password}"
+      input=${smc_ini_provisioning}
+
+  # register mgt daemon to systemd and start
+  # ----------------------------------------
+  - ${smc_base}/bin/install/mgtservice.sh
+  - systemctl enable sgMgtServer
+  - systemctl start sgMgtServer
+  - sed -i 's/h2aInstalledLog=true/h2aInstalledLog=false/' ${smc_base}/uninstall/history.txt
+  - sed -i 's/h2aInstalledMgtService=false/h2aInstalledMgtService=true/' ${smc_base}/uninstall/history.txt
+  - sudo timeout 120 wait_server_started.sh -p ${smc_base} -s MGT
+
+  # wait for rest api to be up
+  # --------------------------
+  - while ! nc -z {{ds.meta_data.local_ipv4}} ${rest_api_port} </dev/null; do echo "waiting for sgMgtServer..."; sleep 3; done
+
+  #declare es server in primary mgmt
+  # --------------------------------
+%{ if es_cluster_address != "" ~}
+  - >
+      create_server
+      --server-kind es_cluster
+      --host {{ds.meta_data.public_hostname}}
+      --port ${rest_api_port}
+      --api-version 6.8
+      --secure
+      --server-name es_backend
+      --server-ip ${es_cluster_address}
+      --es-cluster-options ${jsonencode(es_cluster_options)}
+%{ endif }
+
+  # logserver started in the primary smc EC2 instance
+  # -------------------------------------------------
+%{ if logserver_local ~}
+  - ${smc_base}/bin/install/logservice.sh
+  - systemctl enable sgLogServer
+  - systemctl start sgLogServer
+  - sed -i 's/h2aInstalledLogService=false/h2aInstalledLogService=true/' ${smc_base}/uninstall/history.txt
+  - sudo timeout 120 wait_server_started.sh -p ${smc_base} -s LOG
+%{ endif ~}
+
+  #wipe tmp files related to provisioning
+  # -------------------------------------
+  - rm -rf ${tmp_provision}
+
+  # add tag 'mgmt_provisioning=ready' to EC2 instance
+  # -------------------------------------------------
+  - aws ec2 --region "{{v1.region}}" create-tags --resources "{{v1.instance_id}}" --tags "Key=mgmt_provisioning,Value=ready"
+
+  # send ready notification via aws sns
+  # -----------------------------------
+  - aws sns --region "{{v1.region}}" publish --topic-arn "${topic_arn}" --message "ready"
